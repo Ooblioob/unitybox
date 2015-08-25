@@ -45,6 +45,7 @@ EXAMPLES = '''
 import os
 from multiprocessing import Pool
 import re
+import ast
 
 # e.g. https://github.com/some-user/repo-name.git@61030e628fa5d6ea49ee9bb70638d5f7125a7f82
 git_re = re.compile(r'^(?P<url>https://(?P<host>[^/]+)/(?P<owner>[^/]+)/(?P<repo>[^\@]+?)(?:\.git)?)(?:\@(?P<revision>.*))?$')
@@ -60,15 +61,26 @@ def _gh_part(url, part_name):
         raise Exception('No {0} in git URL: {1}'.format(part_name, url))
 
 
+def combine_results(result_list):
+	overall_result = {'rc': 0, 'stdout': "", 'stderr': ""}
+	for command_result in result_list:
+		overall_result['stdout'] += "{0}{1}".format(command_result['stdout'], os.linesep)
+		overall_result['stderr'] += "{0}{1}".format(command_result['stderr'], os.linesep)
+		if overall_result['rc'] == 0 and command_result['rc'] != 0:
+			overall_result['rc'] = command_result['rc']
+	return overall_result
+
+
 def run_command_with_exceptions(module, cmd, *args, **kwargs):
 	# if we use check_rc inside a subprocess the failure
 	# will not get bubbled up to the main process and will
 	# hang
 	kwargs['check_rc'] = False
-	rc, stdout, stderr = module.run_command(cmd, *args, **kwargs)
-	if rc != 0:
-		raise Exception("`{0}` exited with error code {1}: {2}".format(cmd, rc, stderr))
-	return rc, stdout, stderr
+	result = dict(zip(['rc', 'stdout', 'stderr'], module.run_command(cmd, *args, **kwargs)))
+	if result['rc'] != 0:
+		raise Exception("`{0}` exited with error code {1}: {2}".format(cmd, result['rc'], result['stderr']))
+	return result
+
 
 def clone_repo(module, url, dest, tag):
 	dest_dirname = os.path.dirname(dest)
@@ -80,13 +92,15 @@ def clone_repo(module, url, dest, tag):
 	cmd = 'git clone --depth 1 {1} {2}'.format(tag, url, dest)
 	return run_command_with_exceptions(module, cmd, cwd=dest_dirname)
 
+
 def has_local_mods(module, dest):
     cmd = "git status -s"
-    rc, stdout, stderr = run_command_with_exceptions(module, cmd, cwd=dest)
-    lines = stdout.splitlines()
+    result = run_command_with_exceptions(module, cmd, cwd=dest)
+    lines = result['stdout'].splitlines()
     lines = filter(lambda c: not re.search('^\\?\\?.*$', c), lines)
 
     return len(lines) > 0
+
 
 def reset(module, dest):
     '''
@@ -97,13 +111,15 @@ def reset(module, dest):
     cmd = "git reset --hard HEAD"
     return run_command_with_exceptions(module, cmd, cwd=dest)
 
+
 def get_version(module, dest, ref="HEAD"):
     ''' samples the version of the git repo '''
 
     cmd = "git rev-parse %s" % (ref)
-    rc, stdout, stderr = run_command_with_exceptions(module, cmd, cwd=dest)
-    sha = stdout.rstrip('\n')
+    result = run_command_with_exceptions(module, cmd, cwd=dest)
+    sha = result['stdout'].rstrip('\n')
     return sha
+
 
 def update_repo(module, url, dest, tag):
 	cmd = "git remote set-url origin {0}".format(url)
@@ -115,34 +131,29 @@ def update_repo(module, url, dest, tag):
 	cmd = "git checkout {0} --force".format(tag)
 	return run_command_with_exceptions(module, cmd, cwd=dest)
 
+
 def clone_or_update_repo(module, url, dest, tag):
 	dest = os.path.abspath(os.path.expanduser(dest))
 	gitconfig = os.path.join(dest, '.git', 'config')
+	command_results = []
 	if not os.path.exists(gitconfig):
 		old_version = "n/a"
-		result = clone_repo(module, url, dest, tag)
+		command_results.append(clone_repo(module, url, dest, tag))
 	else:
 		if has_local_mods(module, dest):
 			reset(module, dest)
 		old_version = get_version(module, dest)
-
-	result = update_repo(module, url, dest, tag)
-		
+	command_results.append(update_repo(module, url, dest, tag))
+	
+	result = combine_results(command_results)
 	new_version = get_version(module, dest)
-	result += (old_version, new_version)
+	result.update({'old_version': old_version, 'new_version': new_version})
 	return result
 
+
 def get_results(workers):
-	results = []
-	for worker in workers:
-		result = worker.get()
-		results.append({
-			"rc": result[0],
-			"stdout": result[1],
-			"stderr": result[2],
-			"changed": result[3] != result[4],
-			})
-	changed = any([result['changed'] for result in results])
+	results = [worker.get() for worker in workers]
+	changed = any([result['old_version'] != result['new_version'] for result in results])
 	return {"results": results, "cloned_repo_status": changed}
 
 
@@ -154,15 +165,16 @@ def main():
 			install_dir=dict(required=True),
 			ensure_pinned=dict(default=True)
     	)
-	)		
+	)
 
 	pool = Pool(processes=module.params['processes'])
 	workers = []
+	ensure_pinned = ast.literal_eval(module.params['ensure_pinned'])
 	for url in module.params['urls']:
 		repo_name = _gh_part(url, 'repo')
 		dest = "{0}/{1}".format(module.params['install_dir'], repo_name)
 		repo_url = _gh_part(url, 'url')
-		tag = _gh_part(url, 'revision') if module.params['ensure_pinned'] else "master"
+		tag = _gh_part(url, 'revision') if ensure_pinned else "master"
 		workers.append(pool.apply_async(clone_or_update_repo, (module, repo_url, dest, tag)))
 
 	pool.close()  # don't accept any more new workers
